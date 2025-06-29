@@ -1,5 +1,5 @@
 //! MEDICAL-GRADE NEURAL INTERFACE SYSTEM
-//! Copyright (c) 2023 NeuroTech Inc. (Apache 2.0 License)
+//. Kurt Kristoff Nitsch (Apache 2.0 License)
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
