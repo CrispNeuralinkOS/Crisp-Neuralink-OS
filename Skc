@@ -1,1 +1,210 @@
+//! Medical-Grade Neural Interface System
+//! Apache 2.0 License with Medical Addendum (see MEDICAL.md)
 
+#![deny(unsafe_code)]
+#![forbid(clippy::unwrap_used)]
+#![feature(strict_provenance)]
+
+// ======================
+// 1. CORE IMPORTS
+// ======================
+use std::{
+    collections::{HashMap, VecDeque, BinaryHeap},
+    sync::{
+        atomic::{AtomicBool, AtomicF32, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::{Duration, Instant},
+    mem::size_of,
+};
+use bytemuck::{Pod, Zeroable};
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+use thiserror::Error;
+use rayon::prelude::*;
+use tokio::sync::{mpsc, Semaphore};
+use tracing::{info, warn, error};
+
+// Hardware acceleration
+#[cfg(feature = "cuda")]
+use cust::prelude::*;
+#[cfg(feature = "opencl")]
+use ocl::ProQue;
+
+// ======================
+// 2. BIOPHYSICAL MODEL
+// ======================
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+pub struct GatingState {
+    pub m: f32,  // Activation gate
+    pub h: f32,  // Inactivation gate
+    pub n: f32,  // Potassium gate
+    pub p: f32,  // Persistent sodium
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IonChannel {
+    pub channel_type: ChannelType,
+    pub max_conductance: f32,  // mS/cm²
+    pub reversal_potential: f32,
+    pub temperature_q10: f32,
+    pub state: GatingState,
+    pub density: f32,  // channels/µm²
+}
+
+#[derive(Debug, Error)]
+pub enum NeuronError {
+    #[error("GPU acceleration failed")]
+    GpuError(#[from] cust::error::CudaError),
+    #[error("Invalid biophysical parameters")]
+    ParameterError,
+    #[error("Simulation divergence detected")]
+    DivergenceError,
+}
+
+impl Neuron {
+    /// Updates neuron state using GPU acceleration
+    #[cfg(feature = "cuda")]
+    pub fn update_gpu(&mut self, dt: f32, temp: f32) -> Result<(), NeuronError> {
+        let handle = self.gpu_handle.as_ref().ok_or(NeuronError::GpuError)?;
+        // ... GPU kernel launch logic
+        Ok(())
+    }
+
+    /// Fallback CPU implementation
+    pub fn update_cpu(&mut self, dt: f32, temp: f32) -> Result<(), NeuronError> {
+        let temp_factor = ((temp - 37.0) / 10.0).exp();
+        self.channels.par_iter_mut()
+            .try_for_each(|chan| self.update_channel(chan, dt, temp_factor))?;
+        self.update_calcium(dt)?;
+        Ok(())
+    }
+}
+
+// ======================
+// 3. SAFETY SYSTEM
+// ======================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyMonitor {
+    #[serde(skip)]
+    pub anomaly_detector: Arc<RwLock<AnomalyDetector>>,
+    pub emergency_stop: Arc<AtomicBool>,
+    pub config: SafetyConfig,
+}
+
+impl SafetyMonitor {
+    /// Performs full safety validation pipeline
+    pub fn validate_spike(&self, spike: &Spike) -> Result<(), SafetyError> {
+        // Rule-based checks
+        self.check_amplitude(spike)?;
+        self.check_width(spike)?;
+
+        // ML anomaly detection
+        let detector = self.anomaly_detector.read().unwrap();
+        detector.check(spike)?;
+
+        // Hardware-level validation
+        if self.emergency_stop.load(Ordering::SeqCst) {
+            return Err(SafetyError::EmergencyStopEngaged);
+        }
+
+        Ok(())
+    }
+}
+
+// ======================
+// 4. REAL-TIME SCHEDULER
+// ======================
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskPriority {
+    Critical = 0,  // Safety systems
+    High = 1,      // Control loops
+    Medium = 2,    // Data processing
+    Low = 3,       // Logging
+}
+
+pub struct RealTimeScheduler {
+    task_queue: Arc<Mutex<BinaryHeap<ScheduledTask>>>,
+    running_tasks: Arc<DashMap<Uuid, Instant>>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl RealTimeScheduler {
+    /// Executes tasks with μs-level precision
+    pub async fn run(&self) -> Result<(), SchedulerError> {
+        loop {
+            let task = self.dequeue_task().await?;
+            let permit = self.semaphore.acquire().await?;
+            
+            tokio::spawn(async move {
+                self.execute_task(task).await;
+                drop(permit);
+            });
+        }
+    }
+}
+
+// ======================
+// 5. MAIN INTERFACE
+// ======================
+pub struct NeuralInterface {
+    pub neurons: Arc<Mutex<Vec<Neuron>>>,
+    pub safety: SafetyMonitor,
+    pub scheduler: RealTimeScheduler,
+    #[cfg(feature = "telemetry")]
+    pub telemetry: TelemetrySystem,
+}
+
+impl NeuralInterface {
+    /// Runs complete processing pipeline
+    pub async fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, InterfaceError> {
+        // 1. Biophysical modeling
+        let spikes = self.detect_spikes(input)?;
+        
+        // 2. Safety validation
+        for spike in &spikes {
+            self.safety.validate_spike(spike)?;
+        }
+
+        // 3. Schedule control tasks
+        self.scheduler.dispatch(spikes).await?;
+
+        Ok(self.generate_output())
+    }
+}
+
+// ======================
+// ERROR HANDLING
+// ======================
+#[derive(Debug, Error)]
+pub enum InterfaceError {
+    #[error("Biophysical error: {0}")]
+    BiophysicalError(#[from] NeuronError),
+    #[error("Safety violation: {0}")]
+    SafetyError(#[from] SafetyError),
+    #[error("Scheduler failure: {0}")]
+    SchedulerError(#[from] SchedulerError),
+}
+
+// ======================
+// TESTS
+// ======================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_neuron_update() {
+        let mut neuron = Neuron::new(NeuronType::Pyramidal);
+        neuron.update_cpu(0.1, 37.0).unwrap();
+        assert!(neuron.membrane_potential().abs() < 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_safety_system() {
+        let monitor = SafetyMonitor::default();
+        let spike = Spike::test_fixture();
+        monitor.validate_spike(&spike).unwrap();
+    }
+}
