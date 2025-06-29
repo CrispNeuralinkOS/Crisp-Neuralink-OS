@@ -1,0 +1,19 @@
+[package]
+name = "neural-interface"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Medical-grade neural interface system"
+
+[features]
+default = ["cpu"]
+cpu = ["rayon"]
+cuda = ["cust"]
+safety = ["isolation-forest"]
+telemetry = ["tracing"]
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+rayon = { version = "1.5", optional = true }
+cust = { version = "0.3", optional = true }
+isolation-forest = { version = "0.2", optional = true }
